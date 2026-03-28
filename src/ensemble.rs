@@ -99,14 +99,8 @@ impl QuantileEnsemble {
                     quantile: Some(q),
                     ..config.clone()
                 };
-                let model = trainer::train_with_validation(
-                    x,
-                    y,
-                    x_val,
-                    y_val,
-                    &q_config,
-                    feature_names,
-                );
+                let model =
+                    trainer::train_with_validation(x, y, x_val, y_val, &q_config, feature_names);
                 (q, model)
             })
             .collect();

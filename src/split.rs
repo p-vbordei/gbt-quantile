@@ -20,6 +20,7 @@
 /// assert_eq!(x_train.len(), 4);
 /// assert_eq!(x_test.len(), 1);
 /// ```
+#[allow(clippy::type_complexity)]
 pub fn train_test_split(
     x: &[Vec<f64>],
     y: &[f64],
@@ -72,7 +73,9 @@ fn lcg_shuffle(indices: &mut [usize], seed: u64) {
     // LCG parameters (same as glibc)
     let mut state = seed;
     for i in (1..n).rev() {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (state >> 33) as usize % (i + 1);
         indices.swap(i, j);
     }
@@ -137,13 +140,15 @@ mod tests {
         let (x_shuffled, _, _, _) = train_test_split(&x, &y, 0.8, Some(42));
 
         // With a shuffle, the training set should differ from a temporal split
-        assert_ne!(x_temporal, x_shuffled, "Shuffled split should differ from temporal");
+        assert_ne!(
+            x_temporal, x_shuffled,
+            "Shuffled split should differ from temporal"
+        );
     }
 
     #[test]
     fn test_empty_data() {
-        let (x_train, y_train, x_test, y_test) =
-            train_test_split(&[], &[], 0.8, None);
+        let (x_train, y_train, x_test, y_test) = train_test_split(&[], &[], 0.8, None);
         assert!(x_train.is_empty());
         assert!(y_train.is_empty());
         assert!(x_test.is_empty());
@@ -174,11 +179,7 @@ mod tests {
         let y: Vec<f64> = (0..37).map(|i| i as f64).collect();
 
         let (x_train, y_train, x_test, y_test) = train_test_split(&x, &y, 0.7, Some(99));
-        assert_eq!(
-            x_train.len() + x_test.len(),
-            37,
-            "No rows should be lost"
-        );
+        assert_eq!(x_train.len() + x_test.len(), 37, "No rows should be lost");
         assert_eq!(y_train.len() + y_test.len(), 37);
     }
 }

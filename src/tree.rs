@@ -51,8 +51,12 @@ pub struct GradientBoostedTree {
     pub metadata: Option<serde_json::Value>,
 }
 
-fn default_schema_version() -> u32 { 1 }
-fn default_output_scale() -> f64 { 1.0 }
+fn default_schema_version() -> u32 {
+    1
+}
+fn default_output_scale() -> f64 {
+    1.0
+}
 
 impl GradientBoostedTree {
     /// Predict a single sample.
@@ -89,7 +93,11 @@ impl GradientBoostedTree {
         let total: f64 = counts.iter().sum();
         let mut importance = HashMap::new();
         for (i, &count) in counts.iter().enumerate() {
-            let imp = if total > 0.0 { count / total } else { 1.0 / n as f64 };
+            let imp = if total > 0.0 {
+                count / total
+            } else {
+                1.0 / n as f64
+            };
             importance.insert(i, imp);
         }
         importance
@@ -101,7 +109,11 @@ impl GradientBoostedTree {
         indexed
             .into_iter()
             .map(|(i, v)| {
-                let name = self.feature_names.get(i).cloned().unwrap_or_else(|| format!("f{i}"));
+                let name = self
+                    .feature_names
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(|| format!("f{i}"));
                 (name, v)
             })
             .collect()
@@ -131,7 +143,11 @@ impl GradientBoostedTree {
 /// Traverse a tree node to get the leaf prediction for a feature vector.
 pub(crate) fn traverse_node(node: &TreeNode, features: &[f64]) -> f64 {
     let val = features.get(node.feature_index).copied().unwrap_or(0.0);
-    let child = if val <= node.threshold { &node.left } else { &node.right };
+    let child = if val <= node.threshold {
+        &node.left
+    } else {
+        &node.right
+    };
     match child {
         NodeRef::Leaf(v) => *v,
         NodeRef::Node(next) => traverse_node(next, features),
@@ -176,9 +192,9 @@ mod tests {
     #[test]
     fn test_predict_left_right() {
         let model = simple_model();
-        assert_eq!(model.predict(&[3.0]), 1.0);  // 3 <= 5 → left
+        assert_eq!(model.predict(&[3.0]), 1.0); // 3 <= 5 → left
         assert_eq!(model.predict(&[7.0]), 10.0); // 7 > 5 → right
-        assert_eq!(model.predict(&[5.0]), 1.0);  // 5 <= 5 → left
+        assert_eq!(model.predict(&[5.0]), 1.0); // 5 <= 5 → left
     }
 
     #[test]

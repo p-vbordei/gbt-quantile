@@ -180,8 +180,7 @@ fn build_tree(
             }
 
             // Gain = reduction in variance
-            let gain = (left_sum * left_sum / left_count)
-                + (right_sum * right_sum / right_count)
+            let gain = (left_sum * left_sum / left_count) + (right_sum * right_sum / right_count)
                 - (total_sum * total_sum / total_count);
 
             if gain > best_gain {
@@ -206,7 +205,11 @@ fn build_tree(
         NodeRef::Leaf(0.0)
     } else {
         NodeRef::Node(Box::new(build_tree(
-            &left_x, &left_pr, &left_r, config, depth + 1,
+            &left_x,
+            &left_pr,
+            &left_r,
+            config,
+            depth + 1,
         )))
     };
 
@@ -214,7 +217,11 @@ fn build_tree(
         NodeRef::Leaf(0.0)
     } else {
         NodeRef::Node(Box::new(build_tree(
-            &right_x, &right_pr, &right_r, config, depth + 1,
+            &right_x,
+            &right_pr,
+            &right_r,
+            config,
+            depth + 1,
         )))
     };
 
@@ -299,6 +306,7 @@ fn split_stats(
 }
 
 /// Partition data into left (feature <= threshold) and right subsets.
+#[allow(clippy::type_complexity)]
 fn partition(
     x: &[Vec<f64>],
     pseudo_residuals: &[f64],
@@ -554,6 +562,9 @@ mod tests {
     fn test_percentile_thresholds_constant() {
         let x = vec![vec![5.0]; 10];
         let thresholds = percentile_thresholds(&x, 0, 10);
-        assert!(thresholds.is_empty(), "Constant feature should produce no thresholds");
+        assert!(
+            thresholds.is_empty(),
+            "Constant feature should produce no thresholds"
+        );
     }
 }

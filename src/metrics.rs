@@ -186,7 +186,11 @@ mod tests {
         let y_true = vec![1.0, 2.0, 3.0];
         let y_pred = vec![1.5, 2.5, 2.5];
         let m = evaluate(&y_true, &y_pred).unwrap();
-        assert!((m.r2 - 0.625).abs() < 1e-10, "R² = {}, expected 0.625", m.r2);
+        assert!(
+            (m.r2 - 0.625).abs() < 1e-10,
+            "R² = {}, expected 0.625",
+            m.r2
+        );
     }
 
     #[test]
@@ -196,7 +200,11 @@ mod tests {
         let y_pred = vec![11.0, 5.0, 22.0];
         let m = evaluate(&y_true, &y_pred).unwrap();
         // MAPE over [10, 20] only: (1/10 + 2/20) / 2 = (0.1 + 0.1) / 2 = 0.1
-        assert!((m.mape - 0.1).abs() < 1e-10, "MAPE = {}, expected 0.1", m.mape);
+        assert!(
+            (m.mape - 0.1).abs() < 1e-10,
+            "MAPE = {}, expected 0.1",
+            m.mape
+        );
     }
 
     #[test]
