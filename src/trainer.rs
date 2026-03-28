@@ -6,6 +6,7 @@
 
 use crate::config::GBTConfig;
 use crate::tree::{traverse_node, GradientBoostedTree, NodeRef, TreeNode};
+use rayon::prelude::*;
 
 /// Train a gradient-boosted tree model.
 ///
@@ -58,6 +59,13 @@ pub fn train_with_validation(
         };
     }
 
+    // Pre-calculate feature thresholds globally for histogram-based boosting.
+    // This avoids O(N log N) sorting per feature per tree split.
+    let feature_thresholds: Vec<Vec<f64>> = (0..n_features)
+        .into_par_iter()
+        .map(|feat_idx| percentile_thresholds(x, feat_idx, config.n_bins))
+        .collect();
+
     // Initialize: base_score = mean(y) for L2, quantile for pinball
     let base_score = if let Some(q) = config.quantile {
         quantile_value(y, q)
@@ -87,7 +95,14 @@ pub fn train_with_validation(
         };
 
         // Build one tree to fit the pseudo-residuals
-        let tree = build_tree(x, &pseudo_residuals, &residuals, config, 0);
+        let tree = build_tree(
+            x,
+            &pseudo_residuals,
+            &residuals,
+            config,
+            0,
+            &feature_thresholds,
+        );
 
         // Update residuals
         for i in 0..n {
@@ -147,6 +162,7 @@ fn build_tree(
     residuals: &[f64],
     config: &GBTConfig,
     depth: usize,
+    feature_thresholds: &[Vec<f64>],
 ) -> TreeNode {
     let n = pseudo_residuals.len();
     let n_features = x.first().map_or(0, |r| r.len());
@@ -157,80 +173,92 @@ fn build_tree(
         return make_leaf_node(leaf_val);
     }
 
-    // Find best split across all features and threshold candidates
-    let mut best_gain = 0.0_f64;
-    let mut best_feature = 0;
-    let mut best_threshold = 0.0;
-    let mut found_split = false;
-
     let total_sum: f64 = pseudo_residuals.iter().sum();
     let total_count = n as f64;
 
-    for feat_idx in 0..n_features {
-        let thresholds = percentile_thresholds(x, feat_idx, config.n_bins);
+    // Find best split across all features and threshold candidates in parallel
+    let best_split = (0..n_features)
+        .into_par_iter()
+        .filter_map(|feat_idx| {
+            let thresholds = &feature_thresholds[feat_idx];
+            let mut local_best_gain = 0.0_f64;
+            let mut local_best_thresh = 0.0;
+            let mut found_local = false;
 
-        for &threshold in &thresholds {
-            let (left_sum, left_count, right_sum, right_count) =
-                split_stats(x, pseudo_residuals, feat_idx, threshold);
+            for &threshold in thresholds {
+                let (left_sum, left_count, right_sum, right_count) =
+                    split_stats(x, pseudo_residuals, feat_idx, threshold);
 
-            if left_count < config.min_samples_leaf as f64
-                || right_count < config.min_samples_leaf as f64
-            {
-                continue;
+                if left_count < config.min_samples_leaf as f64
+                    || right_count < config.min_samples_leaf as f64
+                {
+                    continue;
+                }
+
+                // Gain = reduction in variance
+                let gain = (left_sum * left_sum / left_count)
+                    + (right_sum * right_sum / right_count)
+                    - (total_sum * total_sum / total_count);
+
+                if gain > local_best_gain {
+                    local_best_gain = gain;
+                    local_best_thresh = threshold;
+                    found_local = true;
+                }
             }
 
-            // Gain = reduction in variance
-            let gain = (left_sum * left_sum / left_count) + (right_sum * right_sum / right_count)
-                - (total_sum * total_sum / total_count);
-
-            if gain > best_gain {
-                best_gain = gain;
-                best_feature = feat_idx;
-                best_threshold = threshold;
-                found_split = true;
+            if found_local {
+                Some((local_best_gain, feat_idx, local_best_thresh))
+            } else {
+                None
             }
+        })
+        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    if let Some((gain, best_feature, best_threshold)) = best_split {
+        if gain > 0.0 {
+            // Partition data and recurse
+            let (left_x, left_pr, left_r, right_x, right_pr, right_r) =
+                partition(x, pseudo_residuals, residuals, best_feature, best_threshold);
+
+            let left = if left_x.is_empty() {
+                NodeRef::Leaf(0.0)
+            } else {
+                NodeRef::Node(Box::new(build_tree(
+                    &left_x,
+                    &left_pr,
+                    &left_r,
+                    config,
+                    depth + 1,
+                    feature_thresholds,
+                )))
+            };
+
+            let right = if right_x.is_empty() {
+                NodeRef::Leaf(0.0)
+            } else {
+                NodeRef::Node(Box::new(build_tree(
+                    &right_x,
+                    &right_pr,
+                    &right_r,
+                    config,
+                    depth + 1,
+                    feature_thresholds,
+                )))
+            };
+
+            return TreeNode {
+                feature_index: best_feature,
+                threshold: best_threshold,
+                left,
+                right,
+            };
         }
     }
 
-    if !found_split {
-        let leaf_val = leaf_value(residuals, config.quantile);
-        return make_leaf_node(leaf_val);
-    }
-
-    // Partition data and recurse
-    let (left_x, left_pr, left_r, right_x, right_pr, right_r) =
-        partition(x, pseudo_residuals, residuals, best_feature, best_threshold);
-
-    let left = if left_x.is_empty() {
-        NodeRef::Leaf(0.0)
-    } else {
-        NodeRef::Node(Box::new(build_tree(
-            &left_x,
-            &left_pr,
-            &left_r,
-            config,
-            depth + 1,
-        )))
-    };
-
-    let right = if right_x.is_empty() {
-        NodeRef::Leaf(0.0)
-    } else {
-        NodeRef::Node(Box::new(build_tree(
-            &right_x,
-            &right_pr,
-            &right_r,
-            config,
-            depth + 1,
-        )))
-    };
-
-    TreeNode {
-        feature_index: best_feature,
-        threshold: best_threshold,
-        left,
-        right,
-    }
+    // Fallback to leaf
+    let leaf_val = leaf_value(residuals, config.quantile);
+    make_leaf_node(leaf_val)
 }
 
 /// Compute the leaf prediction value: quantile of residuals or mean.
@@ -435,7 +463,7 @@ mod tests {
             min_samples_leaf: 5,
             quantile: None,
             early_stopping_rounds: None,
-            n_bins: 10,
+            n_bins: 255,
         };
         let model = train(&x, &y, &config, None);
         assert!(model.n_trees() > 0, "Model should have trees");
@@ -461,7 +489,7 @@ mod tests {
             min_samples_leaf: 5,
             quantile: Some(0.1),
             early_stopping_rounds: None,
-            n_bins: 10,
+            n_bins: 255,
         };
         let config_p90 = GBTConfig {
             quantile: Some(0.9),
@@ -497,7 +525,7 @@ mod tests {
             min_samples_leaf: 5,
             quantile: None,
             early_stopping_rounds: Some(3),
-            n_bins: 10,
+            n_bins: 255,
         };
 
         let model = train_with_validation(x_train, y_train, x_val, y_val, &config, None);

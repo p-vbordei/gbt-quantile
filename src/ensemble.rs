@@ -4,6 +4,7 @@
 use crate::config::GBTConfig;
 use crate::trainer;
 use crate::tree::GradientBoostedTree;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// A prediction from a quantile ensemble, containing one value per quantile.
@@ -93,7 +94,7 @@ impl QuantileEnsemble {
         feature_names: Option<&[String]>,
     ) -> Self {
         let mut models: Vec<(f64, GradientBoostedTree)> = quantiles
-            .iter()
+            .par_iter()
             .map(|&q| {
                 let q_config = GBTConfig {
                     quantile: Some(q),
@@ -145,25 +146,23 @@ impl QuantileEnsemble {
     }
 }
 
-/// Enforce monotonicity: ensure p_lower <= p_higher by chaining `.max()`.
+/// Enforce monotonicity: ensure p_lower <= p_higher by sorting predictions.
 ///
-/// After sorting by quantile, we sweep forward and enforce that each
-/// prediction is at least as large as the previous one.
+/// True quantiles form a monotonically increasing CDF. If models cross and predict
+/// out of order, sorting the predictions is a robust way to enforce monotonicity
+/// without allowing a single low-quantile outlier to clamp all subsequent higher quantiles.
 fn enforce_monotonicity(raw: &[(f64, f64)]) -> Vec<(f64, f64)> {
     if raw.is_empty() {
         return vec![];
     }
 
-    let mut result = Vec::with_capacity(raw.len());
-    let mut prev = f64::NEG_INFINITY;
+    let mut values: Vec<f64> = raw.iter().map(|(_, v)| *v).collect();
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    for &(q, v) in raw {
-        let enforced = v.max(prev);
-        result.push((q, enforced));
-        prev = enforced;
-    }
-
-    result
+    raw.iter()
+        .zip(values)
+        .map(|(&(q, _), enforced_v)| (q, enforced_v))
+        .collect()
 }
 
 #[cfg(test)]
@@ -194,7 +193,7 @@ mod tests {
             min_samples_leaf: 5,
             quantile: None, // overridden per quantile
             early_stopping_rounds: None,
-            n_bins: 10,
+            n_bins: 255,
         };
 
         let quantiles = vec![0.1, 0.25, 0.5, 0.75, 0.9];
@@ -232,7 +231,7 @@ mod tests {
             min_samples_leaf: 5,
             quantile: None,
             early_stopping_rounds: None,
-            n_bins: 10,
+            n_bins: 255,
         };
 
         let quantiles = vec![0.1, 0.5, 0.9];
@@ -275,7 +274,7 @@ mod tests {
             min_samples_leaf: 5,
             quantile: None,
             early_stopping_rounds: None,
-            n_bins: 10,
+            n_bins: 255,
         };
 
         let quantiles = vec![0.1, 0.5, 0.9];
@@ -293,8 +292,9 @@ mod tests {
         // Simulate out-of-order raw predictions
         let raw = vec![(0.1, 5.0), (0.5, 3.0), (0.9, 7.0)];
         let enforced = enforce_monotonicity(&raw);
-        assert_eq!(enforced[0].1, 5.0);
-        assert_eq!(enforced[1].1, 5.0); // clamped up from 3.0
+        // By sorting: [3.0, 5.0, 7.0]
+        assert_eq!(enforced[0].1, 3.0);
+        assert_eq!(enforced[1].1, 5.0);
         assert_eq!(enforced[2].1, 7.0);
     }
 
@@ -308,7 +308,7 @@ mod tests {
             min_samples_leaf: 5,
             quantile: None,
             early_stopping_rounds: None,
-            n_bins: 10,
+            n_bins: 255,
         };
 
         let quantiles = vec![0.1, 0.5, 0.9];

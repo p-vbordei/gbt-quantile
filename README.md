@@ -11,7 +11,8 @@ The first Rust GBT crate with pinball loss for probabilistic prediction interval
 - **JSON serialization** — save and load models as human-readable JSON
 - **Quantile ensemble** — train multiple quantile models in one call with monotonicity enforcement
 - **Evaluation metrics** — MAE, RMSE, R², MAPE, pinball loss
-- **Zero dependencies** beyond serde — no BLAS, LAPACK, or C++ libraries
+- **High Performance** — global histogram thresholding and Rayon multi-threading
+- **Zero dependencies** beyond serde and rayon — no BLAS, LAPACK, or C++ libraries
 - **Schema versioned** — forward-compatible model format
 
 ## Quick Start

@@ -28,7 +28,7 @@ impl Default for GBTConfig {
             min_samples_leaf: 10,
             quantile: None,
             early_stopping_rounds: Some(5),
-            n_bins: 10,
+            n_bins: 255,
         }
     }
 }
@@ -46,6 +46,6 @@ mod tests {
         assert_eq!(config.min_samples_leaf, 10);
         assert!(config.quantile.is_none());
         assert_eq!(config.early_stopping_rounds, Some(5));
-        assert_eq!(config.n_bins, 10);
+        assert_eq!(config.n_bins, 255);
     }
 }
