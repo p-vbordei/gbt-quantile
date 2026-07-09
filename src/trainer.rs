@@ -3,10 +3,41 @@
 //! Supports squared-error (L2) loss for mean regression and pinball loss
 //! for quantile regression. Includes early stopping with periodic
 //! validation checks and automatic tree truncation.
+//!
+//! Training is histogram-based: each feature is quantized to at most 255
+//! bins once up front, so finding the best split at a node costs a single
+//! O(n) pass per feature instead of rescanning all rows per candidate
+//! threshold. Nodes track row indices rather than copying feature rows.
 
 use crate::config::GBTConfig;
 use crate::tree::{traverse_node, GradientBoostedTree, NodeRef, TreeNode};
 use rayon::prelude::*;
+
+/// Pre-binned training data: per-feature bin indices and the threshold
+/// edges separating consecutive bins.
+struct BinnedData {
+    /// `bins[f][i]` = bin index of row `i` for feature `f` (column-major).
+    bins: Vec<Vec<u8>>,
+    /// `edges[f][b]` = value threshold separating bin `b` from bin `b + 1`.
+    /// A split "bin <= b" is equivalent to "value <= edges[f][b]".
+    edges: Vec<Vec<f64>>,
+}
+
+fn bin_data(x: &[Vec<f64>], n_features: usize, n_bins: usize) -> BinnedData {
+    let n_bins = n_bins.min(255); // bin indices must fit in u8
+    let (bins, edges): (Vec<Vec<u8>>, Vec<Vec<f64>>) = (0..n_features)
+        .into_par_iter()
+        .map(|f| {
+            let edges = percentile_thresholds(x, f, n_bins);
+            let bins = x
+                .iter()
+                .map(|row| edges.partition_point(|&t| row[f] > t) as u8)
+                .collect();
+            (bins, edges)
+        })
+        .unzip();
+    BinnedData { bins, edges }
+}
 
 /// Train a gradient-boosted tree model.
 ///
@@ -59,12 +90,9 @@ pub fn train_with_validation(
         };
     }
 
-    // Pre-calculate feature thresholds globally for histogram-based boosting.
-    // This avoids O(N log N) sorting per feature per tree split.
-    let feature_thresholds: Vec<Vec<f64>> = (0..n_features)
-        .into_par_iter()
-        .map(|feat_idx| percentile_thresholds(x, feat_idx, config.n_bins))
-        .collect();
+    // Quantize features once; every tree reuses the same bins.
+    let binned = bin_data(x, n_features, config.n_bins);
+    let all_indices: Vec<usize> = (0..n).collect();
 
     // Initialize: base_score = mean(y) for L2, quantile for pinball
     let base_score = if let Some(q) = config.quantile {
@@ -96,12 +124,12 @@ pub fn train_with_validation(
 
         // Build one tree to fit the pseudo-residuals
         let tree = build_tree(
-            x,
+            &all_indices,
             &pseudo_residuals,
             &residuals,
             config,
             0,
-            &feature_thresholds,
+            &binned,
         );
 
         // Update residuals
@@ -156,42 +184,59 @@ pub fn train_with_validation(
 }
 
 /// Build a single decision tree to fit pseudo-residuals.
+///
+/// `indices` are the rows belonging to this node; child nodes get
+/// partitioned index sets rather than copies of the feature rows.
 fn build_tree(
-    x: &[Vec<f64>],
+    indices: &[usize],
     pseudo_residuals: &[f64],
     residuals: &[f64],
     config: &GBTConfig,
     depth: usize,
-    feature_thresholds: &[Vec<f64>],
+    binned: &BinnedData,
 ) -> TreeNode {
-    let n = pseudo_residuals.len();
-    let n_features = x.first().map_or(0, |r| r.len());
+    let n = indices.len();
+    let n_features = binned.bins.len();
 
     // Leaf conditions: max depth reached, too few samples, or no features
     if depth >= config.max_depth || n <= config.min_samples_leaf * 2 || n_features == 0 {
-        let leaf_val = leaf_value(residuals, config.quantile);
-        return make_leaf_node(leaf_val);
+        return make_leaf_node(leaf_value(indices, residuals, config.quantile));
     }
 
-    let total_sum: f64 = pseudo_residuals.iter().sum();
+    let total_sum: f64 = indices.iter().map(|&i| pseudo_residuals[i]).sum();
     let total_count = n as f64;
+    let min_count = config.min_samples_leaf as f64;
 
-    // Find best split across all features and threshold candidates in parallel
+    // Find the best split: one histogram pass per feature, in parallel.
     let best_split = (0..n_features)
         .into_par_iter()
         .filter_map(|feat_idx| {
-            let thresholds = &feature_thresholds[feat_idx];
-            let mut local_best_gain = 0.0_f64;
-            let mut local_best_thresh = 0.0;
-            let mut found_local = false;
+            let edges = &binned.edges[feat_idx];
+            let n_edges = edges.len();
+            if n_edges == 0 {
+                return None; // constant feature
+            }
 
-            for &threshold in thresholds {
-                let (left_sum, left_count, right_sum, right_count) =
-                    split_stats(x, pseudo_residuals, feat_idx, threshold);
+            let feature_bins = &binned.bins[feat_idx];
+            let mut sums = vec![0.0_f64; n_edges + 1];
+            let mut counts = vec![0.0_f64; n_edges + 1];
+            for &i in indices {
+                let b = feature_bins[i] as usize;
+                sums[b] += pseudo_residuals[i];
+                counts[b] += 1.0;
+            }
 
-                if left_count < config.min_samples_leaf as f64
-                    || right_count < config.min_samples_leaf as f64
-                {
+            // Cumulative scan: split after bin b means "value <= edges[b]" goes left.
+            let mut left_sum = 0.0;
+            let mut left_count = 0.0;
+            let mut local_best: Option<(f64, usize)> = None; // (gain, edge index)
+            for b in 0..n_edges {
+                left_sum += sums[b];
+                left_count += counts[b];
+                let right_sum = total_sum - left_sum;
+                let right_count = total_count - left_count;
+
+                if left_count < min_count || right_count < min_count {
                     continue;
                 }
 
@@ -200,56 +245,43 @@ fn build_tree(
                     + (right_sum * right_sum / right_count)
                     - (total_sum * total_sum / total_count);
 
-                if gain > local_best_gain {
-                    local_best_gain = gain;
-                    local_best_thresh = threshold;
-                    found_local = true;
+                if gain > local_best.map_or(0.0, |(g, _)| g) {
+                    local_best = Some((gain, b));
                 }
             }
 
-            if found_local {
-                Some((local_best_gain, feat_idx, local_best_thresh))
-            } else {
-                None
-            }
+            local_best.map(|(gain, b)| (gain, feat_idx, b))
         })
         .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-    if let Some((gain, best_feature, best_threshold)) = best_split {
+    if let Some((gain, best_feature, best_edge)) = best_split {
         if gain > 0.0 {
-            // Partition data and recurse
-            let (left_x, left_pr, left_r, right_x, right_pr, right_r) =
-                partition(x, pseudo_residuals, residuals, best_feature, best_threshold);
+            let feature_bins = &binned.bins[best_feature];
+            let (left_idx, right_idx): (Vec<usize>, Vec<usize>) = indices
+                .iter()
+                .partition(|&&i| (feature_bins[i] as usize) <= best_edge);
 
-            let left = if left_x.is_empty() {
-                NodeRef::Leaf(0.0)
-            } else {
-                NodeRef::Node(Box::new(build_tree(
-                    &left_x,
-                    &left_pr,
-                    &left_r,
-                    config,
-                    depth + 1,
-                    feature_thresholds,
-                )))
-            };
-
-            let right = if right_x.is_empty() {
-                NodeRef::Leaf(0.0)
-            } else {
-                NodeRef::Node(Box::new(build_tree(
-                    &right_x,
-                    &right_pr,
-                    &right_r,
-                    config,
-                    depth + 1,
-                    feature_thresholds,
-                )))
-            };
+            // min_samples_leaf in the gain scan guarantees both sides are non-empty
+            let left = NodeRef::Node(Box::new(build_tree(
+                &left_idx,
+                pseudo_residuals,
+                residuals,
+                config,
+                depth + 1,
+                binned,
+            )));
+            let right = NodeRef::Node(Box::new(build_tree(
+                &right_idx,
+                pseudo_residuals,
+                residuals,
+                config,
+                depth + 1,
+                binned,
+            )));
 
             return TreeNode {
                 feature_index: best_feature,
-                threshold: best_threshold,
+                threshold: binned.edges[best_feature][best_edge],
                 left,
                 right,
             };
@@ -257,16 +289,16 @@ fn build_tree(
     }
 
     // Fallback to leaf
-    let leaf_val = leaf_value(residuals, config.quantile);
-    make_leaf_node(leaf_val)
+    make_leaf_node(leaf_value(indices, residuals, config.quantile))
 }
 
 /// Compute the leaf prediction value: quantile of residuals or mean.
-fn leaf_value(residuals: &[f64], quantile: Option<f64>) -> f64 {
+fn leaf_value(indices: &[usize], residuals: &[f64], quantile: Option<f64>) -> f64 {
+    let node_residuals: Vec<f64> = indices.iter().map(|&i| residuals[i]).collect();
     if let Some(q) = quantile {
-        quantile_value(residuals, q)
+        quantile_value(&node_residuals, q)
     } else {
-        mean(residuals)
+        mean(&node_residuals)
     }
 }
 
@@ -288,7 +320,8 @@ fn make_leaf_node(value: f64) -> TreeNode {
 /// Get percentile-based threshold candidates for a feature.
 ///
 /// Sorts unique feature values and picks `n_bins` evenly spaced midpoints.
-/// Returns an empty vec if the feature is constant.
+/// Returns an empty vec if the feature is constant. The returned thresholds
+/// are strictly increasing and double as histogram bin edges.
 fn percentile_thresholds(x: &[Vec<f64>], feat_idx: usize, n_bins: usize) -> Vec<f64> {
     let mut values: Vec<f64> = x.iter().map(|row| row[feat_idx]).collect();
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -306,69 +339,6 @@ fn percentile_thresholds(x: &[Vec<f64>], feat_idx: usize, n_bins: usize) -> Vec<
     }
     thresholds.dedup();
     thresholds
-}
-
-/// Compute sum and count for left/right partitions at a given split point.
-fn split_stats(
-    x: &[Vec<f64>],
-    residuals: &[f64],
-    feat_idx: usize,
-    threshold: f64,
-) -> (f64, f64, f64, f64) {
-    let mut left_sum = 0.0;
-    let mut left_count = 0.0;
-    let mut right_sum = 0.0;
-    let mut right_count = 0.0;
-
-    for (i, row) in x.iter().enumerate() {
-        if row[feat_idx] <= threshold {
-            left_sum += residuals[i];
-            left_count += 1.0;
-        } else {
-            right_sum += residuals[i];
-            right_count += 1.0;
-        }
-    }
-
-    (left_sum, left_count, right_sum, right_count)
-}
-
-/// Partition data into left (feature <= threshold) and right subsets.
-#[allow(clippy::type_complexity)]
-fn partition(
-    x: &[Vec<f64>],
-    pseudo_residuals: &[f64],
-    residuals: &[f64],
-    feat_idx: usize,
-    threshold: f64,
-) -> (
-    Vec<Vec<f64>>,
-    Vec<f64>,
-    Vec<f64>,
-    Vec<Vec<f64>>,
-    Vec<f64>,
-    Vec<f64>,
-) {
-    let mut left_x = Vec::new();
-    let mut left_pr = Vec::new();
-    let mut left_r = Vec::new();
-    let mut right_x = Vec::new();
-    let mut right_pr = Vec::new();
-    let mut right_r = Vec::new();
-
-    for (i, row) in x.iter().enumerate() {
-        if row[feat_idx] <= threshold {
-            left_x.push(row.clone());
-            left_pr.push(pseudo_residuals[i]);
-            left_r.push(residuals[i]);
-        } else {
-            right_x.push(row.clone());
-            right_pr.push(pseudo_residuals[i]);
-            right_r.push(residuals[i]);
-        }
-    }
-
-    (left_x, left_pr, left_r, right_x, right_pr, right_r)
 }
 
 /// Compute the mean of a slice.
@@ -594,5 +564,24 @@ mod tests {
             thresholds.is_empty(),
             "Constant feature should produce no thresholds"
         );
+    }
+
+    #[test]
+    fn test_binning_roundtrip() {
+        // Rows with bin index <= b must be exactly the rows with value <= edges[b]
+        let x: Vec<Vec<f64>> = (0..100).map(|i| vec![(i % 17) as f64]).collect();
+        let binned = bin_data(&x, 1, 8);
+        let edges = &binned.edges[0];
+        assert!(!edges.is_empty());
+        for (i, row) in x.iter().enumerate() {
+            for (b, &edge) in edges.iter().enumerate() {
+                assert_eq!(
+                    (binned.bins[0][i] as usize) <= b,
+                    row[0] <= edge,
+                    "row {i} value {} edge {edge}",
+                    row[0]
+                );
+            }
+        }
     }
 }
