@@ -1,6 +1,6 @@
 [package]
 name = "gbt-quantile"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Pure-Rust gradient-boosted trees with quantile regression. First GBT crate with pinball loss, early stopping, and JSON-serializable models."
 license = "MIT OR Apache-2.0"

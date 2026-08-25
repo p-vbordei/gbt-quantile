@@ -187,6 +187,15 @@ pub fn train_with_validation(
 ///
 /// `indices` are the rows belonging to this node; child nodes get
 /// partitioned index sets rather than copies of the feature rows.
+///
+/// Minimum node sizes for switching the per-feature split search onto the
+/// rayon pool. Below these, one histogram pass per feature is too little
+/// work to amortize the per-node dispatch overhead, which costs more than
+/// the threads save; at and above them the parallelism pays off.
+const PAR_FEATURES_MIN: usize = 32;
+/// Minimum node row count for the same rayon decision (see PAR_FEATURES_MIN).
+const PAR_ROWS_MIN: usize = 4096;
+
 fn build_tree(
     indices: &[usize],
     pseudo_residuals: &[f64],
@@ -207,52 +216,62 @@ fn build_tree(
     let total_count = n as f64;
     let min_count = config.min_samples_leaf as f64;
 
-    // Find the best split: one histogram pass per feature, in parallel.
-    let best_split = (0..n_features)
-        .into_par_iter()
-        .filter_map(|feat_idx| {
-            let edges = &binned.edges[feat_idx];
-            let n_edges = edges.len();
-            if n_edges == 0 {
-                return None; // constant feature
+    // Find the best split: one histogram pass per feature. Both code paths
+    // run the same scan; rayon is used only when the per-feature work is
+    // large enough (many features or many rows) to cover the dispatch cost.
+    let scan_feature = |feat_idx: usize| -> Option<(f64, usize, usize)> {
+        let edges = &binned.edges[feat_idx];
+        let n_edges = edges.len();
+        if n_edges == 0 {
+            return None; // constant feature
+        }
+
+        let feature_bins = &binned.bins[feat_idx];
+        let mut sums = vec![0.0_f64; n_edges + 1];
+        let mut counts = vec![0.0_f64; n_edges + 1];
+        for &i in indices {
+            let b = feature_bins[i] as usize;
+            sums[b] += pseudo_residuals[i];
+            counts[b] += 1.0;
+        }
+
+        // Cumulative scan: split after bin b means "value <= edges[b]" goes left.
+        let mut left_sum = 0.0;
+        let mut left_count = 0.0;
+        let mut local_best: Option<(f64, usize)> = None; // (gain, edge index)
+        for b in 0..n_edges {
+            left_sum += sums[b];
+            left_count += counts[b];
+            let right_sum = total_sum - left_sum;
+            let right_count = total_count - left_count;
+
+            if left_count < min_count || right_count < min_count {
+                continue;
             }
 
-            let feature_bins = &binned.bins[feat_idx];
-            let mut sums = vec![0.0_f64; n_edges + 1];
-            let mut counts = vec![0.0_f64; n_edges + 1];
-            for &i in indices {
-                let b = feature_bins[i] as usize;
-                sums[b] += pseudo_residuals[i];
-                counts[b] += 1.0;
+            // Gain = reduction in variance
+            let gain = (left_sum * left_sum / left_count)
+                + (right_sum * right_sum / right_count)
+                - (total_sum * total_sum / total_count);
+
+            if gain > local_best.map_or(0.0, |(g, _)| g) {
+                local_best = Some((gain, b));
             }
+        }
 
-            // Cumulative scan: split after bin b means "value <= edges[b]" goes left.
-            let mut left_sum = 0.0;
-            let mut left_count = 0.0;
-            let mut local_best: Option<(f64, usize)> = None; // (gain, edge index)
-            for b in 0..n_edges {
-                left_sum += sums[b];
-                left_count += counts[b];
-                let right_sum = total_sum - left_sum;
-                let right_count = total_count - left_count;
+        local_best.map(|(gain, b)| (gain, feat_idx, b))
+    };
 
-                if left_count < min_count || right_count < min_count {
-                    continue;
-                }
-
-                // Gain = reduction in variance
-                let gain = (left_sum * left_sum / left_count)
-                    + (right_sum * right_sum / right_count)
-                    - (total_sum * total_sum / total_count);
-
-                if gain > local_best.map_or(0.0, |(g, _)| g) {
-                    local_best = Some((gain, b));
-                }
-            }
-
-            local_best.map(|(gain, b)| (gain, feat_idx, b))
-        })
-        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let best_split = if n_features >= PAR_FEATURES_MIN || n >= PAR_ROWS_MIN {
+        (0..n_features)
+            .into_par_iter()
+            .filter_map(&scan_feature)
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+    } else {
+        (0..n_features)
+            .filter_map(&scan_feature)
+            .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+    };
 
     if let Some((gain, best_feature, best_edge)) = best_split {
         if gain > 0.0 {
