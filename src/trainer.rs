@@ -23,17 +23,124 @@ struct BinnedData {
     edges: Vec<Vec<f64>>,
 }
 
-fn bin_data(x: &[Vec<f64>], n_features: usize, n_bins: usize) -> BinnedData {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaticThresholdSpec {
+    Hour,
+    Dow,
+    Binary,
+}
+
+fn detect_static_threshold_spec(
+    feat_name: Option<&str>,
+    x: &[Vec<f64>],
+    f: usize,
+) -> Option<StaticThresholdSpec> {
+    if let Some(name) = feat_name {
+        let lower = name.to_ascii_lowercase();
+        if lower == "hour" || lower.ends_with("_hour") || lower == "hourofday" {
+            return Some(StaticThresholdSpec::Hour);
+        }
+        if lower == "dow"
+            || lower == "day_of_week"
+            || lower == "dayofweek"
+            || lower.ends_with("_dow")
+        {
+            return Some(StaticThresholdSpec::Dow);
+        }
+        if lower == "is_weekend"
+            || lower == "weekend"
+            || lower == "is_holiday"
+            || lower == "holiday"
+        {
+            return Some(StaticThresholdSpec::Binary);
+        }
+    }
+
+    // Auto-detection when feature names are absent or default ("f0", "f1", ...):
+    if x.len() >= 48 {
+        let mut min_val = f64::INFINITY;
+        let mut max_val = f64::NEG_INFINITY;
+        let mut all_integers = true;
+        let mut bitmask: u32 = 0;
+
+        for row in x {
+            let v = row[f];
+            if !v.is_finite() || v.fract() != 0.0 {
+                all_integers = false;
+                break;
+            }
+            if v < min_val {
+                min_val = v;
+            }
+            if v > max_val {
+                max_val = v;
+            }
+            if (0.0..=31.0).contains(&v) {
+                bitmask |= 1 << (v as u32);
+            }
+        }
+
+        if all_integers {
+            if min_val == 0.0 && max_val == 1.0 && bitmask == 0b11 {
+                return Some(StaticThresholdSpec::Binary);
+            }
+            if min_val == 0.0 && max_val == 6.0 && bitmask == 0b111_1111 {
+                return Some(StaticThresholdSpec::Dow);
+            }
+            if min_val == 0.0 && max_val == 23.0 && bitmask == ((1 << 24) - 1) {
+                return Some(StaticThresholdSpec::Hour);
+            }
+        }
+    }
+
+    None
+}
+
+fn bin_data(
+    x: &[Vec<f64>],
+    n_features: usize,
+    n_bins: usize,
+    feature_names: Option<&[String]>,
+) -> BinnedData {
     let n_bins = n_bins.min(255); // bin indices must fit in u8
     let (bins, edges): (Vec<Vec<u8>>, Vec<Vec<f64>>) = (0..n_features)
         .into_par_iter()
         .map(|f| {
-            let edges = percentile_thresholds(x, f, n_bins);
-            let bins = x
-                .iter()
-                .map(|row| edges.partition_point(|&t| row[f] > t) as u8)
-                .collect();
-            (bins, edges)
+            let feat_name = feature_names.and_then(|names| names.get(f).map(|s| s.as_str()));
+            match detect_static_threshold_spec(feat_name, x, f) {
+                Some(StaticThresholdSpec::Hour) => {
+                    let edges: Vec<f64> = (0..23).map(|h| h as f64 + 0.5).collect();
+                    let bins: Vec<u8> = x
+                        .iter()
+                        .map(|row| row[f].clamp(0.0, 23.0) as u8)
+                        .collect();
+                    (bins, edges)
+                }
+                Some(StaticThresholdSpec::Dow) => {
+                    let edges = vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5];
+                    let bins: Vec<u8> = x
+                        .iter()
+                        .map(|row| row[f].clamp(0.0, 6.0) as u8)
+                        .collect();
+                    (bins, edges)
+                }
+                Some(StaticThresholdSpec::Binary) => {
+                    let edges = vec![0.5];
+                    let bins: Vec<u8> = x
+                        .iter()
+                        .map(|row| (row[f] > 0.5) as u8)
+                        .collect();
+                    (bins, edges)
+                }
+                None => {
+                    let edges = percentile_thresholds(x, f, n_bins);
+                    let bins: Vec<u8> = x
+                        .iter()
+                        .map(|row| edges.partition_point(|&t| row[f] > t) as u8)
+                        .collect();
+                    (bins, edges)
+                }
+            }
         })
         .unzip();
     BinnedData { bins, edges }
@@ -91,8 +198,8 @@ pub fn train_with_validation(
     }
 
     // Quantize features once; every tree reuses the same bins.
-    let binned = bin_data(x, n_features, config.n_bins);
-    let all_indices: Vec<usize> = (0..n).collect();
+    let binned = bin_data(x, n_features, config.n_bins, feature_names);
+    let mut all_indices: Vec<usize> = (0..n).collect();
 
     // Initialize: base_score = mean(y) for L2, quantile for pinball
     let base_score = if let Some(q) = config.quantile {
@@ -105,50 +212,63 @@ pub fn train_with_validation(
     let mut residuals: Vec<f64> = y.iter().map(|yi| yi - base_score).collect();
     let mut trees = Vec::with_capacity(config.n_trees);
 
-    // Early stopping state
+    // Early stopping state & incremental validation prediction accumulator
     let has_validation = !x_val.is_empty() && !y_val.is_empty();
+    let mut val_predictions = if has_validation {
+        vec![base_score; y_val.len()]
+    } else {
+        vec![]
+    };
     let mut best_val_loss = f64::MAX;
     let mut rounds_without_improvement = 0_usize;
     let mut best_n_trees = 0_usize;
 
-    for round in 0..config.n_trees {
-        // For quantile loss, compute pseudo-residuals
-        let pseudo_residuals = if let Some(q) = config.quantile {
-            residuals
-                .iter()
-                .map(|&r| if r >= 0.0 { q } else { q - 1.0 })
-                .collect::<Vec<_>>()
-        } else {
-            residuals.clone() // L2: gradient = residual
-        };
+    // Pre-allocated reusable scratchpad buffers to eliminate per-node / per-round heap allocations
+    let mut pseudo_residuals = Vec::with_capacity(n);
+    let mut leaf_scratch = Vec::with_capacity(n);
 
-        // Build one tree to fit the pseudo-residuals
+    for round in 0..config.n_trees {
+        // Reset all_indices for deterministic root order
+        for (i, idx) in all_indices.iter_mut().enumerate() {
+            *idx = i;
+        }
+
+        // For quantile loss, compute pseudo-residuals into reusable buffer
+        pseudo_residuals.clear();
+        if let Some(q) = config.quantile {
+            pseudo_residuals.extend(residuals.iter().map(|&r| if r >= 0.0 { q } else { q - 1.0 }));
+        } else {
+            pseudo_residuals.extend_from_slice(&residuals);
+        }
+
+        // Build one tree to fit the pseudo-residuals; training residuals are updated
+        // in-place during terminal leaf assignment, eliminating redundant full-dataset traversals.
         let tree = build_tree(
-            &all_indices,
+            &mut all_indices,
             &pseudo_residuals,
-            &residuals,
+            &mut residuals,
             config,
             0,
             &binned,
+            &mut leaf_scratch,
         );
-
-        // Update residuals
-        for i in 0..n {
-            let pred = traverse_node(&tree, &x[i]);
-            residuals[i] -= config.learning_rate * pred;
-        }
 
         trees.push(tree);
 
-        // Early stopping: check validation loss periodically
+        // Incremental validation prediction accumulation: O(N_val) per tree instead of O(N_val * T)
+        if has_validation {
+            let tree_ref = trees.last().unwrap();
+            for (i, x_row) in x_val.iter().enumerate() {
+                val_predictions[i] += config.learning_rate * traverse_node(tree_ref, x_row);
+            }
+        }
+
+        // Early stopping: check validation loss periodically in a single O(N_val) pass
         if let Some(es_rounds) = config.early_stopping_rounds {
             if has_validation && ((round + 1) % 5 == 0 || round == config.n_trees - 1) {
-                let val_loss = compute_validation_loss(
-                    x_val,
+                let val_loss = evaluate_validation_loss(
                     y_val,
-                    &trees,
-                    base_score,
-                    config.learning_rate,
+                    &val_predictions,
                     config.quantile,
                 );
 
@@ -186,7 +306,7 @@ pub fn train_with_validation(
 /// Build a single decision tree to fit pseudo-residuals.
 ///
 /// `indices` are the rows belonging to this node; child nodes get
-/// partitioned index sets rather than copies of the feature rows.
+/// partitioned in-place on the index slice rather than copying feature rows.
 ///
 /// Minimum node sizes for switching the per-feature split search onto the
 /// rayon pool. Below these, one histogram pass per feature is too little
@@ -197,19 +317,26 @@ const PAR_FEATURES_MIN: usize = 32;
 const PAR_ROWS_MIN: usize = 4096;
 
 fn build_tree(
-    indices: &[usize],
+    indices: &mut [usize],
     pseudo_residuals: &[f64],
-    residuals: &[f64],
+    residuals: &mut [f64],
     config: &GBTConfig,
     depth: usize,
     binned: &BinnedData,
+    leaf_scratch: &mut Vec<f64>,
 ) -> TreeNode {
     let n = indices.len();
     let n_features = binned.bins.len();
 
     // Leaf conditions: max depth reached, too few samples, or no features
     if depth >= config.max_depth || n <= config.min_samples_leaf * 2 || n_features == 0 {
-        return make_leaf_node(leaf_value(indices, residuals, config.quantile));
+        return create_leaf_and_update_residuals(
+            indices,
+            residuals,
+            config.learning_rate,
+            config.quantile,
+            leaf_scratch,
+        );
     }
 
     let total_sum: f64 = indices.iter().map(|&i| pseudo_residuals[i]).sum();
@@ -227,9 +354,10 @@ fn build_tree(
         }
 
         let feature_bins = &binned.bins[feat_idx];
-        let mut sums = vec![0.0_f64; n_edges + 1];
-        let mut counts = vec![0.0_f64; n_edges + 1];
-        for &i in indices {
+        // Stack-allocated arrays: zero heap allocation, bounded by u8 max bins (256)
+        let mut sums = [0.0_f64; 256];
+        let mut counts = [0.0_f64; 256];
+        for &i in indices.iter() {
             let b = feature_bins[i] as usize;
             sums[b] += pseudo_residuals[i];
             counts[b] += 1.0;
@@ -276,26 +404,37 @@ fn build_tree(
     if let Some((gain, best_feature, best_edge)) = best_split {
         if gain > 0.0 {
             let feature_bins = &binned.bins[best_feature];
-            let (left_idx, right_idx): (Vec<usize>, Vec<usize>) = indices
-                .iter()
-                .partition(|&&i| (feature_bins[i] as usize) <= best_edge);
+            // In-place two-pointer partitioning: zero heap allocations
+            let mut left = 0;
+            let mut right = indices.len();
+            while left < right {
+                if (feature_bins[indices[left]] as usize) <= best_edge {
+                    left += 1;
+                } else {
+                    right -= 1;
+                    indices.swap(left, right);
+                }
+            }
+            let (left_indices, right_indices) = indices.split_at_mut(left);
 
             // min_samples_leaf in the gain scan guarantees both sides are non-empty
             let left = NodeRef::Node(Box::new(build_tree(
-                &left_idx,
+                left_indices,
                 pseudo_residuals,
                 residuals,
                 config,
                 depth + 1,
                 binned,
+                leaf_scratch,
             )));
             let right = NodeRef::Node(Box::new(build_tree(
-                &right_idx,
+                right_indices,
                 pseudo_residuals,
                 residuals,
                 config,
                 depth + 1,
                 binned,
+                leaf_scratch,
             )));
 
             return TreeNode {
@@ -307,17 +446,55 @@ fn build_tree(
         }
     }
 
-    // Fallback to leaf
-    make_leaf_node(leaf_value(indices, residuals, config.quantile))
+    // Fallback to leaf with in-place residual update
+    create_leaf_and_update_residuals(
+        indices,
+        residuals,
+        config.learning_rate,
+        config.quantile,
+        leaf_scratch,
+    )
+}
+
+/// Compute leaf prediction and directly update training residuals in-place.
+fn create_leaf_and_update_residuals(
+    indices: &[usize],
+    residuals: &mut [f64],
+    learning_rate: f64,
+    quantile: Option<f64>,
+    leaf_scratch: &mut Vec<f64>,
+) -> TreeNode {
+    let val = leaf_value(indices, residuals, quantile, leaf_scratch);
+    let safe_val = if val.is_finite() { val } else { 0.0 };
+    let step = learning_rate * safe_val;
+    for &i in indices {
+        residuals[i] -= step;
+    }
+    make_leaf_node(safe_val)
 }
 
 /// Compute the leaf prediction value: quantile of residuals or mean.
-fn leaf_value(indices: &[usize], residuals: &[f64], quantile: Option<f64>) -> f64 {
-    let node_residuals: Vec<f64> = indices.iter().map(|&i| residuals[i]).collect();
+fn leaf_value(
+    indices: &[usize],
+    residuals: &[f64],
+    quantile: Option<f64>,
+    leaf_scratch: &mut Vec<f64>,
+) -> f64 {
+    if indices.is_empty() {
+        return 0.0;
+    }
     if let Some(q) = quantile {
-        quantile_value(&node_residuals, q)
+        leaf_scratch.clear();
+        leaf_scratch.extend(indices.iter().map(|&i| residuals[i]));
+        leaf_scratch.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let pos = (leaf_scratch.len() as f64 - 1.0) * q;
+        let idx = pos.floor() as usize;
+        let frac = pos - idx as f64;
+        let upper_idx = (idx + 1).min(leaf_scratch.len() - 1);
+        leaf_scratch[idx] * (1.0 - frac) + leaf_scratch[upper_idx] * frac
     } else {
-        mean(&node_residuals)
+        let sum: f64 = indices.iter().map(|&i| residuals[i]).sum();
+        sum / indices.len() as f64
     }
 }
 
@@ -360,23 +537,13 @@ fn percentile_thresholds(x: &[Vec<f64>], feat_idx: usize, n_bins: usize) -> Vec<
     thresholds
 }
 
-/// Compute the mean of a slice.
-fn mean(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-    values.iter().sum::<f64>() / values.len() as f64
-}
-
-/// Compute validation loss for the current ensemble.
+/// Evaluate validation loss for the current ensemble predictions.
 ///
+/// Evaluates in a single O(N_val) pass over incrementally accumulated predictions.
 /// Uses MSE for L2 loss, pinball loss for quantile regression.
-fn compute_validation_loss(
-    x_val: &[Vec<f64>],
+fn evaluate_validation_loss(
     y_val: &[f64],
-    trees: &[TreeNode],
-    base_score: f64,
-    learning_rate: f64,
+    val_predictions: &[f64],
     quantile: Option<f64>,
 ) -> f64 {
     let n = y_val.len();
@@ -386,11 +553,7 @@ fn compute_validation_loss(
 
     let mut total_loss = 0.0;
     for i in 0..n {
-        let mut pred = base_score;
-        for tree in trees {
-            pred += learning_rate * traverse_node(tree, &x_val[i]);
-        }
-        let error = y_val[i] - pred;
+        let error = y_val[i] - val_predictions[i];
         total_loss += if let Some(q) = quantile {
             // Pinball loss
             if error >= 0.0 {
@@ -422,6 +585,7 @@ pub(crate) fn quantile_value(values: &[f64], q: f64) -> f64 {
     let upper_idx = (idx + 1).min(sorted.len() - 1);
     sorted[idx] * (1.0 - frac) + sorted[upper_idx] * frac
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -589,7 +753,7 @@ mod tests {
     fn test_binning_roundtrip() {
         // Rows with bin index <= b must be exactly the rows with value <= edges[b]
         let x: Vec<Vec<f64>> = (0..100).map(|i| vec![(i % 17) as f64]).collect();
-        let binned = bin_data(&x, 1, 8);
+        let binned = bin_data(&x, 1, 8, None);
         let edges = &binned.edges[0];
         assert!(!edges.is_empty());
         for (i, row) in x.iter().enumerate() {
@@ -603,4 +767,67 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_static_thresholds_hour() {
+        let n = 96;
+        let x: Vec<Vec<f64>> = (0..n).map(|i| vec![(i % 24) as f64]).collect();
+        let names = vec!["hour".to_string()];
+        let binned = bin_data(&x, 1, 255, Some(&names));
+        let edges = &binned.edges[0];
+        assert_eq!(edges.len(), 23, "Hour must have 23 static edges (0.5..22.5)");
+        assert_eq!(edges[0], 0.5);
+        assert_eq!(edges[22], 22.5);
+        for (i, row) in x.iter().enumerate() {
+            let h = row[0] as u8;
+            assert_eq!(binned.bins[0][i], h, "Bin must match hour directly in O(1)");
+        }
+    }
+
+    #[test]
+    fn test_static_thresholds_dow() {
+        let n = 70;
+        let x: Vec<Vec<f64>> = (0..n).map(|i| vec![(i % 7) as f64]).collect();
+        let names = vec!["dow".to_string()];
+        let binned = bin_data(&x, 1, 255, Some(&names));
+        let edges = &binned.edges[0];
+        assert_eq!(edges.len(), 6, "DOW must have 6 static edges (0.5..5.5)");
+        assert_eq!(edges, &[0.5, 1.5, 2.5, 3.5, 4.5, 5.5]);
+        for (i, row) in x.iter().enumerate() {
+            let d = row[0] as u8;
+            assert_eq!(binned.bins[0][i], d, "Bin must match DOW directly in O(1)");
+        }
+    }
+
+    #[test]
+    fn test_static_thresholds_binary() {
+        let x = vec![vec![0.0], vec![1.0], vec![0.0], vec![1.0]];
+        let names = vec!["is_weekend".to_string()];
+        let binned = bin_data(&x, 1, 255, Some(&names));
+        let edges = &binned.edges[0];
+        assert_eq!(edges, &[0.5], "Binary features must have a single edge at 0.5");
+        assert_eq!(binned.bins[0], vec![0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn test_incremental_validation_accuracy() {
+        let (x, y) = linear_data(100);
+        let config = GBTConfig {
+            n_trees: 20,
+            max_depth: 3,
+            learning_rate: 0.1,
+            min_samples_leaf: 5,
+            quantile: None,
+            early_stopping_rounds: Some(5),
+            n_bins: 255,
+        };
+        let model = train_with_validation(&x[..80], &y[..80], &x[80..], &y[80..], &config, None);
+        assert!(model.n_trees() > 0);
+        // Predictions on validation set should be reasonable
+        for xi in &x[80..] {
+            let pred = model.predict(xi);
+            assert!(pred.is_finite());
+        }
+    }
 }
+
